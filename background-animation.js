@@ -160,76 +160,87 @@ vec3 hsv2rgb(vec3 c) {
   return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
 }
 
-float dot_sdf(vec2 p) {
-  vec2 center = vec2(0.5, 0.3);
-  float dist = length(p - center) - 0.08;
-  return 1.0 - smoothstep(0.0, 0.05, dist);
-}
-
-float dash_sdf(vec2 p) {
-  vec2 center = vec2(0.5, 0.5);
-  float dist = abs(p.y - center.y) - 0.05;
-  float width = step(0.25, p.x) * step(p.x, 0.75);
-  dist = max(dist, 1.0 - width);
-  return 1.0 - smoothstep(0.0, 0.05, dist);
-}
-
-float plus_sdf(vec2 p) {
-  vec2 center = vec2(0.5);
-  vec2 d = abs(p - center);
-  float horizontal = step(d.y, 0.06) * step(d.x, 0.3);
-  float vertical = step(d.x, 0.06) * step(d.y, 0.3);
-  return max(horizontal, vertical);
-}
-
-float ring_sdf(vec2 p) {
-  vec2 center = vec2(0.5);
-  float dist = abs(length(p - center) - 0.25);
-  return 1.0 - smoothstep(0.05, 0.1, dist);
-}
-
-float cross_sdf(vec2 p) {
-  vec2 center = vec2(0.5);
-  vec2 q = p - center;
-
-  float angle = 0.785398;
-  vec2 rotated = vec2(
-    q.x * cos(angle) - q.y * sin(angle),
-    q.x * sin(angle) + q.y * cos(angle)
-  );
-
-  vec2 d = abs(rotated);
-  float horizontal = step(d.y, 0.06) * step(d.x, 0.35);
-  float vertical = step(d.x, 0.06) * step(d.y, 0.35);
-  return max(horizontal, vertical);
+float hexagon_sdf(vec2 p, float size) {
+  vec3 k = vec3(-0.866025404, 0.5, 0.577350269);
+  p = abs(p - 0.5);
+  p -= 2.0 * min(dot(k.xy, p), 0.0) * k.xy;
+  p -= vec2(clamp(p.x, -k.z * size, k.z * size), size);
+  return step(length(p) * sign(p.y), 0.0);
 }
 
 void main() {
   vec2 pixelCoord = v_uv * u_resolution;
-  vec2 cellCoord = floor(pixelCoord / u_cellSize);
-  vec2 cellUV = fract(pixelCoord / u_cellSize);
 
-  vec2 sampleUV = (cellCoord * u_cellSize + u_cellSize * 0.5) / u_resolution;
+  // Hexagonal grid constants (flat-top hexagons)
+  float hexRadius = u_cellSize * 0.5; // radius from center to vertex
+  float hexWidth = hexRadius * 2.0; // vertex to vertex (horizontal)
+  float hexHeight = hexRadius * 1.732050808; // sqrt(3) * radius (vertical flat-to-flat)
+
+  // Horizontal and vertical spacing between hex centers
+  float horizSpacing = hexWidth * 0.75; // 3/4 of width
+  float vertSpacing = hexHeight;
+
+  // Convert to hexagonal grid coordinates
+  vec2 hexCoord = vec2(pixelCoord.x / horizSpacing, pixelCoord.y / vertSpacing);
+
+  // Get approximate column and row
+  float col = floor(hexCoord.x);
+  float row = floor(hexCoord.y - mod(col, 2.0) * 0.5);
+
+  // Calculate candidate hexagon centers (need to check neighboring cells)
+  vec2 candidates[7];
+  candidates[0] = vec2(col, row + mod(col, 2.0) * 0.5);
+  candidates[1] = vec2(col + 1.0, row + mod(col + 1.0, 2.0) * 0.5);
+  candidates[2] = vec2(col - 1.0, row + mod(col - 1.0, 2.0) * 0.5);
+  candidates[3] = vec2(col, row + 1.0 + mod(col, 2.0) * 0.5);
+  candidates[4] = vec2(col, row - 1.0 + mod(col, 2.0) * 0.5);
+  candidates[5] = vec2(col + 1.0, row + 1.0 + mod(col + 1.0, 2.0) * 0.5);
+  candidates[6] = vec2(col - 1.0, row + 1.0 + mod(col - 1.0, 2.0) * 0.5);
+
+  // Find closest hexagon center
+  vec2 closestHex = candidates[0];
+  float minDist = 1e10;
+
+  for (int i = 0; i < 7; i++) {
+    vec2 hexCenterPixel = vec2(
+      candidates[i].x * horizSpacing,
+      candidates[i].y * vertSpacing
+    );
+    float dist = length(pixelCoord - hexCenterPixel);
+    if (dist < minDist) {
+      minDist = dist;
+      closestHex = candidates[i];
+    }
+  }
+
+  // Calculate pixel position of the closest hexagon center
+  vec2 hexCenterPixel = vec2(closestHex.x * horizSpacing, closestHex.y * vertSpacing);
+
+  // Calculate UV within the hexagon cell (normalized to 0-1)
+  vec2 cellUV = (pixelCoord - hexCenterPixel) / hexWidth + 0.5;
+
+  // Sample noise from hexagon center
+  vec2 sampleUV = hexCenterPixel / u_resolution;
   float noise = texture(u_noiseTex, sampleUV).r;
 
   float brightness = noise * u_brightness;
   brightness = (brightness - 0.5) * u_contrast + 0.5;
   brightness = clamp(brightness, 0.0, 1.0);
 
-  float glyph = 0.0;
-  if (brightness < u_threshold1) {
-    glyph = 0.0;
-  } else if (brightness < u_threshold2) {
-    glyph = dot_sdf(cellUV);
-  } else if (brightness < u_threshold3) {
-    glyph = dash_sdf(cellUV);
-  } else if (brightness < u_threshold4) {
-    glyph = plus_sdf(cellUV);
-  } else if (brightness < u_threshold5) {
-    glyph = ring_sdf(cellUV);
-  } else {
-    glyph = cross_sdf(cellUV);
-  }
+  // Rotate cellUV by 60 degrees (π/3 radians = 1.047198)
+  vec2 center = vec2(0.5);
+  vec2 p = cellUV - center;
+  float angle = 1.047198; // 60 degrees
+  vec2 rotatedUV = vec2(
+    p.x * cos(angle) - p.y * sin(angle),
+    p.x * sin(angle) + p.y * cos(angle)
+  ) + center;
+
+  // Use brightness to determine hexagon size (0.0 to 0.45 range for smaller hexagons)
+  float hexSize = brightness * 0.45;
+
+  // Render the hexagon if it's above the first threshold
+  float glyph = (brightness > u_threshold1) ? hexagon_sdf(rotatedUV, hexSize) : 0.0;
 
   vec3 color = hsv2rgb(vec3(u_hue / 360.0, u_saturation, brightness));
 
